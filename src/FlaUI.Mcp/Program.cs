@@ -19,6 +19,10 @@ toolRegistry.RegisterTool(new ListWindowsTool(sessionManager));
 toolRegistry.RegisterTool(new FocusWindowTool(sessionManager));
 toolRegistry.RegisterTool(new CloseWindowTool(sessionManager));
 toolRegistry.RegisterTool(new BatchTool(sessionManager, elementRegistry));
+toolRegistry.RegisterTool(new FileDialogTool(sessionManager));
+toolRegistry.RegisterTool(new WaitForElementTool(sessionManager, elementRegistry));
+toolRegistry.RegisterTool(new FindElementsTool(sessionManager, elementRegistry));
+toolRegistry.RegisterTool(new GetTableDataTool(elementRegistry));
 
 // Create and run MCP server
 var server = new McpServer(toolRegistry);
