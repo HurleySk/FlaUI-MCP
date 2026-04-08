@@ -67,8 +67,20 @@ public class FileDialogTool : ToolBase
             if (dialog == null)
                 return ErrorResult($"No file dialog appeared within {timeout}ms. Make sure you clicked a Browse/Open button first.");
 
+            // Brief delay to let the dialog fully initialize its UIA tree
+            await Task.Delay(200);
+            dialog.Focus();
+            await Task.Delay(100);
+
             // Strategy 1: Find the filename edit control by AutomationId "1148" (standard Windows file dialog)
-            var filenameEdit = FindFilenameEdit(dialog);
+            // Retry a few times since modal dialog controls may not be immediately available
+            AutomationElement? filenameEdit = null;
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                filenameEdit = FindFilenameEdit(dialog);
+                if (filenameEdit != null) break;
+                await Task.Delay(300);
+            }
             if (filenameEdit != null)
             {
                 // Clear and fill

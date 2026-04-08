@@ -307,7 +307,17 @@ public class GetTableDataTool : ToolBase
             var textChild = cell.FindFirstChild(cf => cf.ByControlType(ControlType.Text));
             if (textChild != null)
             {
-                return textChild.Properties.Name.ValueOrDefault ?? "";
+                var textName = textChild.Properties.Name.ValueOrDefault ?? "";
+                if (!string.IsNullOrEmpty(textName)) return textName;
+            }
+
+            // Try LegacyIAccessible pattern (works for WinForms DataGridView)
+            if (cell.Patterns.LegacyIAccessible.IsSupported)
+            {
+                var legacyValue = cell.Patterns.LegacyIAccessible.Pattern.Value.ValueOrDefault;
+                if (!string.IsNullOrEmpty(legacyValue)) return legacyValue;
+                var legacyName = cell.Patterns.LegacyIAccessible.Pattern.Name.ValueOrDefault;
+                if (!string.IsNullOrEmpty(legacyName)) return legacyName;
             }
 
             return "";
