@@ -46,7 +46,7 @@ public class ScreenshotTool : ToolBase
         }
     };
 
-    public override Task<McpToolResult> ExecuteAsync(JsonElement? arguments)
+    public override async Task<McpToolResult> ExecuteAsync(JsonElement? arguments)
     {
         var handle = GetStringArgument(arguments, "handle");
         var refId = GetStringArgument(arguments, "ref");
@@ -65,7 +65,7 @@ public class ScreenshotTool : ToolBase
                 var element = _elementRegistry.GetElement(refId);
                 if (element == null)
                 {
-                    return Task.FromResult(ErrorResult($"Element not found: {refId}"));
+                    return ErrorResult($"Element not found: {refId}");
                 }
                 capture = Capture.Element(element);
             }
@@ -74,8 +74,11 @@ public class ScreenshotTool : ToolBase
                 var window = _sessionManager.GetWindow(handle);
                 if (window == null)
                 {
-                    return Task.FromResult(ErrorResult($"Window not found: {handle}"));
+                    return ErrorResult($"Window not found: {handle}");
                 }
+                // Focus the window first to ensure we capture the correct one
+                window.Focus();
+                await Task.Delay(200);
                 capture = Capture.Element(window);
             }
             else
@@ -84,7 +87,7 @@ public class ScreenshotTool : ToolBase
                 var focusedElement = _sessionManager.Automation.FocusedElement();
                 if (focusedElement == null)
                 {
-                    return Task.FromResult(ErrorResult("No focused window found"));
+                    return ErrorResult("No focused window found");
                 }
 
                 // Walk up to find the window
@@ -96,21 +99,24 @@ public class ScreenshotTool : ToolBase
 
                 if (current == null)
                 {
-                    return Task.FromResult(ErrorResult("Could not find window for focused element"));
+                    return ErrorResult("Could not find window for focused element");
                 }
 
                 capture = Capture.Element(current);
             }
 
             using var stream = new MemoryStream();
-            capture.Bitmap.Save(stream, System.Drawing.Imaging.ImageFormat.Png);
+            using (capture)
+            {
+                capture.Bitmap.Save(stream, System.Drawing.Imaging.ImageFormat.Png);
+            }
             var imageData = stream.ToArray();
 
-            return Task.FromResult(ImageResult(imageData, "image/png"));
+            return ImageResult(imageData, "image/png");
         }
         catch (Exception ex)
         {
-            return Task.FromResult(ErrorResult($"Failed to capture screenshot: {ex.Message}"));
+            return ErrorResult($"Failed to capture screenshot: {ex.Message}");
         }
     }
 }
