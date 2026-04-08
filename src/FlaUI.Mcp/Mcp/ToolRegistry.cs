@@ -19,6 +19,8 @@ public class ToolRegistry
         return _tools.Values.Select(t => t.GetDefinition()).ToList();
     }
 
+    private const int DefaultTimeoutMs = 30000;
+
     public async Task<McpToolResult> ExecuteToolAsync(string name, JsonElement? arguments)
     {
         if (!_tools.TryGetValue(name, out var tool))
@@ -35,7 +37,29 @@ public class ToolRegistry
 
         try
         {
-            return await tool.ExecuteAsync(arguments);
+            var toolTask = tool.ExecuteAsync(arguments);
+            var timeoutTask = Task.Delay(DefaultTimeoutMs);
+
+            if (await Task.WhenAny(toolTask, timeoutTask) == timeoutTask)
+            {
+                // Observe the abandoned task's exception to avoid UnobservedTaskException
+                _ = toolTask.ContinueWith(
+                    t => { _ = t.Exception; },
+                    TaskContinuationOptions.OnlyOnFaulted);
+
+                return new McpToolResult
+                {
+                    Content = new List<McpContent>
+                    {
+                        new() { Type = "text", Text = $"Tool '{name}' timed out after {DefaultTimeoutMs}ms. " +
+                            "A modal dialog (e.g., file Open/Save) may be blocking the UI. " +
+                            "Try using windows_file_dialog to dismiss the dialog first." }
+                    },
+                    IsError = true
+                };
+            }
+
+            return await toolTask;
         }
         catch (Exception ex)
         {

@@ -8,7 +8,6 @@ namespace PlaywrightWindows.Mcp;
 public class McpServer
 {
     private readonly ToolRegistry _toolRegistry;
-    private bool _initialized = false;
 
     public McpServer(ToolRegistry toolRegistry)
     {
@@ -87,7 +86,7 @@ public class McpServer
 
     private McpInitializeResult HandleInitialize(JsonRpcRequest request)
     {
-        _initialized = true;
+        // Server initialization complete
         return new McpInitializeResult
         {
             ProtocolVersion = "2024-11-05",
