@@ -11,7 +11,9 @@ using PlaywrightWindows.Mcp.Core;
 namespace PlaywrightWindows.Mcp.Tools;
 
 /// <summary>
-/// Automate Windows file open/save dialogs
+/// Automate Windows file open/save dialogs.
+/// Uses UIA for normal dialogs, falls back to pure Win32+SendInput
+/// when WinForms modal dialogs block UIA.
 /// </summary>
 public class FileDialogTool : ToolBase
 {
@@ -65,84 +67,18 @@ public class FileDialogTool : ToolBase
 
         try
         {
-            var (dialog, hwnd) = await WaitForFileDialog(timeout);
-            if (dialog == null)
-                return ErrorResult($"No file dialog appeared within {timeout}ms. Make sure you clicked a Browse/Open button first.");
+            // Phase 1: Try UIA-based approach (fast path for non-modal dialogs)
+            var uiaResult = await TryUiaApproach(path, action, timeout);
+            if (uiaResult != null)
+                return uiaResult;
 
-            // Brief delay to let the dialog fully initialize its UIA tree
-            await Task.Delay(200);
+            // Phase 2: Pure Win32+SendInput fallback (for WinForms modal dialogs
+            // where all UIA calls hang because the parent UI thread is blocked)
+            var win32Result = await TryWin32Approach(path, timeout);
+            if (win32Result != null)
+                return win32Result;
 
-            // Use SetForegroundWindow via native HWND — more reliable than UIA Focus()
-            // when the parent app's UI thread is blocked by a modal dialog
-            if (hwnd != IntPtr.Zero)
-                NativeMethods.SetForegroundWindow(hwnd);
-            else
-                dialog.Focus();
-            await Task.Delay(100);
-
-            // Strategy 1: Find the filename edit control by AutomationId "1148" (standard Windows file dialog)
-            // Retry a few times since modal dialog controls may not be immediately available.
-            // Wrap in Task.Run with timeout to protect against UIA hangs.
-            AutomationElement? filenameEdit = null;
-            for (int attempt = 0; attempt < 3; attempt++)
-            {
-                var findTask = Task.Run(() => FindFilenameEdit(dialog));
-                if (await Task.WhenAny(findTask, Task.Delay(3000)) == findTask)
-                    filenameEdit = await findTask;
-                if (filenameEdit != null) break;
-                await Task.Delay(300);
-            }
-            if (filenameEdit != null)
-            {
-                // Clear and fill
-                if (filenameEdit.Patterns.Value.IsSupported)
-                {
-                    filenameEdit.Patterns.Value.Pattern.SetValue(path);
-                }
-                else
-                {
-                    filenameEdit.Focus();
-                    Keyboard.TypeSimultaneously(VirtualKeyShort.CONTROL, VirtualKeyShort.KEY_A);
-                    await Task.Delay(50);
-                    Keyboard.Type(path);
-                }
-
-                await Task.Delay(100);
-
-                // Find and click Open/Save button (with timeout protection)
-                AutomationElement? confirmButton = null;
-                var btnTask = Task.Run(() => FindConfirmButton(dialog, action));
-                if (await Task.WhenAny(btnTask, Task.Delay(3000)) == btnTask)
-                    confirmButton = await btnTask;
-
-                if (confirmButton != null)
-                {
-                    if (confirmButton.Patterns.Invoke.IsSupported)
-                        confirmButton.Patterns.Invoke.Pattern.Invoke();
-                    else
-                        confirmButton.Click();
-
-                    return TextResult($"File dialog completed: {path}");
-                }
-
-                // Fallback: press Enter
-                Keyboard.Press(VirtualKeyShort.ENTER);
-                return TextResult($"File dialog completed (Enter key): {path}");
-            }
-
-            // Strategy 2: Keyboard-based fallback — use native HWND focus
-            if (hwnd != IntPtr.Zero)
-                NativeMethods.SetForegroundWindow(hwnd);
-            else
-                dialog.Focus();
-            await Task.Delay(100);
-
-            // Type the path directly — most file dialogs accept keyboard input in the filename field
-            Keyboard.Type(path);
-            await Task.Delay(100);
-            Keyboard.Press(VirtualKeyShort.ENTER);
-
-            return TextResult($"File dialog completed (keyboard fallback): {path}");
+            return ErrorResult($"No file dialog appeared within {timeout}ms. Make sure you clicked a Browse/Open button first.");
         }
         catch (Exception ex)
         {
@@ -150,14 +86,19 @@ public class FileDialogTool : ToolBase
         }
     }
 
-    private async Task<(Window? dialog, IntPtr hwnd)> WaitForFileDialog(int timeoutMs)
+    /// <summary>
+    /// UIA-based approach: find dialog via UIA tree, interact via automation patterns.
+    /// Returns null if UIA times out (indicating modal blocking).
+    /// </summary>
+    private async Task<McpToolResult?> TryUiaApproach(string path, string action, int timeout)
     {
         var sw = Stopwatch.StartNew();
-        while (sw.ElapsedMilliseconds < timeoutMs)
+        // Give UIA at most half the timeout or 3s, whichever is less
+        var uiaTimeout = Math.Min(timeout / 2, 3000);
+
+        while (sw.ElapsedMilliseconds < uiaTimeout)
         {
-            // Strategy A: Try UIA tree traversal with a short inner timeout.
-            // This is the fast path for non-WinForms dialogs where UIA works fine.
-            var uiaTask = Task.Run(() =>
+            var findTask = Task.Run(() =>
             {
                 try
                 {
@@ -181,39 +122,179 @@ public class FileDialogTool : ToolBase
                                     return win.AsWindow();
                             }
                         }
-                        catch { /* Skip inaccessible windows */ }
+                        catch { }
                     }
                 }
-                catch { /* UIA traversal failed entirely */ }
+                catch { }
                 return null;
             });
 
-            if (await Task.WhenAny(uiaTask, Task.Delay(2000)) == uiaTask)
+            if (await Task.WhenAny(findTask, Task.Delay(2000)) == findTask)
             {
-                var result = await uiaTask;
-                if (result != null)
-                    return (result, IntPtr.Zero);
-            }
-
-            // Strategy B: Win32 fallback — EnumWindows bypasses UIA entirely.
-            // WinForms modal dialogs block UIA desktop traversal but are still
-            // discoverable via Win32 and can be wrapped with Automation.FromHandle().
-            var dialogHwnd = FindDialogHwndViaWin32();
-            if (dialogHwnd != IntPtr.Zero)
-            {
-                try
+                var dialog = await findTask;
+                if (dialog != null)
                 {
-                    var element = _sessionManager.Automation.FromHandle(dialogHwnd);
-                    if (element != null)
-                        return (element.AsWindow(), dialogHwnd);
+                    await Task.Delay(200);
+                    dialog.Focus();
+                    await Task.Delay(100);
+                    return await InteractViaUia(dialog, path, action);
                 }
-                catch { /* FromHandle can fail if the dialog is closing */ }
+            }
+            else
+            {
+                // UIA hung — modal is blocking, bail to Win32
+                return null;
             }
 
             await Task.Delay(200);
         }
 
-        return (null, IntPtr.Zero);
+        return null; // UIA didn't find anything in time
+    }
+
+    /// <summary>
+    /// Interact with a dialog found via UIA using automation patterns.
+    /// </summary>
+    private async Task<McpToolResult> InteractViaUia(Window dialog, string path, string action)
+    {
+        AutomationElement? filenameEdit = null;
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            filenameEdit = FindFilenameEdit(dialog);
+            if (filenameEdit != null) break;
+            await Task.Delay(300);
+        }
+
+        if (filenameEdit != null)
+        {
+            if (filenameEdit.Patterns.Value.IsSupported)
+            {
+                filenameEdit.Patterns.Value.Pattern.SetValue(path);
+            }
+            else
+            {
+                filenameEdit.Focus();
+                Keyboard.TypeSimultaneously(VirtualKeyShort.CONTROL, VirtualKeyShort.KEY_A);
+                await Task.Delay(50);
+                Keyboard.Type(path);
+            }
+
+            await Task.Delay(100);
+
+            var confirmButton = FindConfirmButton(dialog, action);
+            if (confirmButton != null)
+            {
+                if (confirmButton.Patterns.Invoke.IsSupported)
+                    confirmButton.Patterns.Invoke.Pattern.Invoke();
+                else
+                    confirmButton.Click();
+
+                return TextResult($"File dialog completed: {path}");
+            }
+
+            Keyboard.Press(VirtualKeyShort.ENTER);
+            return TextResult($"File dialog completed (Enter key): {path}");
+        }
+
+        // UIA found the dialog but couldn't find controls — use keyboard
+        dialog.Focus();
+        await Task.Delay(100);
+        Keyboard.Type(path);
+        await Task.Delay(100);
+        Keyboard.Press(VirtualKeyShort.ENTER);
+        return TextResult($"File dialog completed (keyboard fallback): {path}");
+    }
+
+    /// <summary>
+    /// Pure Win32+SendInput approach: find the dialog via EnumWindows (no UIA),
+    /// focus it via SetForegroundWindow, and type the path via SendInput.
+    /// This works even when WinForms modal dialogs block all UIA calls.
+    /// </summary>
+    private async Task<McpToolResult?> TryWin32Approach(string path, int timeout)
+    {
+        var sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < timeout)
+        {
+            var hwnd = FindDialogHwndViaWin32();
+            if (hwnd != IntPtr.Zero)
+            {
+                // Found dialog via Win32 — interact purely through Win32+SendInput
+                await Task.Delay(300); // let dialog stabilize
+
+                // Focus the dialog via Win32 (no UIA involved)
+                NativeMethods.SetForegroundWindow(hwnd);
+                await Task.Delay(200);
+
+                // Try to find and set the filename edit via Win32 messages first
+                var filenameSet = TrySetFilenameViaWin32(hwnd, path);
+                if (filenameSet)
+                {
+                    await Task.Delay(100);
+                    // Press Enter via SendInput to confirm
+                    Keyboard.Press(VirtualKeyShort.ENTER);
+                    return TextResult($"File dialog completed (Win32): {path}");
+                }
+
+                // Fallback: use SendInput keyboard — the filename combo typically
+                // has focus when the dialog opens, so just type into it
+                NativeMethods.SetForegroundWindow(hwnd);
+                await Task.Delay(100);
+
+                // Select all existing text, then type the new path
+                Keyboard.TypeSimultaneously(VirtualKeyShort.CONTROL, VirtualKeyShort.KEY_A);
+                await Task.Delay(50);
+                Keyboard.Type(path);
+                await Task.Delay(200);
+                Keyboard.Press(VirtualKeyShort.ENTER);
+
+                return TextResult($"File dialog completed (Win32 keyboard): {path}");
+            }
+
+            await Task.Delay(200);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Try to set the filename in the dialog's edit control using Win32 messages.
+    /// Finds the ComboBoxEx32 > ComboBox > Edit chain or a direct Edit child,
+    /// then uses WM_SETTEXT to set the path.
+    /// </summary>
+    private static bool TrySetFilenameViaWin32(IntPtr dialogHwnd, string path)
+    {
+        // Standard file dialog has: ComboBoxEx32 (id 1148) > ComboBox > Edit
+        var comboBoxEx = NativeMethods.FindWindowEx(dialogHwnd, IntPtr.Zero, "ComboBoxEx32", null);
+        if (comboBoxEx != IntPtr.Zero)
+        {
+            var comboBox = NativeMethods.FindWindowEx(comboBoxEx, IntPtr.Zero, "ComboBox", null);
+            if (comboBox != IntPtr.Zero)
+            {
+                var edit = NativeMethods.FindWindowEx(comboBox, IntPtr.Zero, "Edit", null);
+                if (edit != IntPtr.Zero)
+                {
+                    NativeMethods.SendMessage(edit, NativeMethods.WM_SETTEXT, IntPtr.Zero, path);
+                    return true;
+                }
+            }
+            // Try direct Edit child of ComboBoxEx32
+            var directEdit = NativeMethods.FindWindowEx(comboBoxEx, IntPtr.Zero, "Edit", null);
+            if (directEdit != IntPtr.Zero)
+            {
+                NativeMethods.SendMessage(directEdit, NativeMethods.WM_SETTEXT, IntPtr.Zero, path);
+                return true;
+            }
+        }
+
+        // Fallback: look for any Edit control that's a direct child
+        var editChild = NativeMethods.FindWindowEx(dialogHwnd, IntPtr.Zero, "Edit", null);
+        if (editChild != IntPtr.Zero)
+        {
+            NativeMethods.SendMessage(editChild, NativeMethods.WM_SETTEXT, IntPtr.Zero, path);
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -226,16 +307,16 @@ public class FileDialogTool : ToolBase
         NativeMethods.EnumWindows((hWnd, _) =>
         {
             if (!NativeMethods.IsWindowVisible(hWnd))
-                return true; // continue
+                return true;
 
             var sb = new StringBuilder(256);
             NativeMethods.GetClassName(hWnd, sb, sb.Capacity);
             if (sb.ToString() == "#32770")
             {
                 found = hWnd;
-                return false; // stop enumeration
+                return false;
             }
-            return true; // continue
+            return true;
         }, IntPtr.Zero);
         return found;
     }
@@ -244,7 +325,6 @@ public class FileDialogTool : ToolBase
     {
         try
         {
-            // Standard file dialog: filename edit has AutomationId "1148"
             var edits = dialog.FindAllDescendants(cf => cf.ByControlType(ControlType.Edit));
             foreach (var edit in edits)
             {
@@ -253,7 +333,6 @@ public class FileDialogTool : ToolBase
                     return edit;
             }
 
-            // Fallback: find the combo box with AutomationId "1148" and get its edit child
             var combos = dialog.FindAllDescendants(cf => cf.ByControlType(ControlType.ComboBox));
             foreach (var combo in combos)
             {
@@ -266,7 +345,6 @@ public class FileDialogTool : ToolBase
                 }
             }
 
-            // Last resort: first visible edit
             return edits.FirstOrDefault();
         }
         catch
@@ -282,7 +360,6 @@ public class FileDialogTool : ToolBase
             var buttons = dialog.FindAllDescendants(cf => cf.ByControlType(ControlType.Button));
             var targetName = action == "save" ? "Save" : "Open";
 
-            // Exact match first
             foreach (var btn in buttons)
             {
                 var name = btn.Properties.Name.ValueOrDefault ?? "";
@@ -290,7 +367,6 @@ public class FileDialogTool : ToolBase
                     return btn;
             }
 
-            // AutomationId "1" is the default OK/Open button
             foreach (var btn in buttons)
             {
                 var autoId = btn.Properties.AutomationId.ValueOrDefault;
@@ -308,6 +384,8 @@ public class FileDialogTool : ToolBase
 
     private static class NativeMethods
     {
+        public const int WM_SETTEXT = 0x000C;
+
         public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
         [DllImport("user32.dll")]
@@ -321,5 +399,11 @@ public class FileDialogTool : ToolBase
 
         [DllImport("user32.dll")]
         public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        public static extern IntPtr FindWindowEx(IntPtr hwndParent, IntPtr hwndChildAfter, string? lpszClass, string? lpszWindow);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, string lParam);
     }
 }
